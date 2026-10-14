@@ -3,6 +3,10 @@ import os
 import sqlite3
 import datetime
 import io
+import base64
+import json
+import urllib.request
+import urllib.error
 import pandas as pd
 import streamlit as st
 
@@ -18,7 +22,6 @@ st.set_page_config(
 
 DB_FILE = "waist_seal_wms.db"
 
-# 默认对照表种子数据（基于《腰封规格对照表.xlsx》）
 DEFAULT_SKU_SPECS = [
     {"工厂": "和光", "材质": "胡桃木", "形状": "圆形", "规格": '16"', "腰封规格": None, "SKU": "MASTHTMRD16"},
     {"工厂": "和光", "材质": "胡桃木", "形状": "圆形", "规格": '18"', "腰封规格": None, "SKU": "MASTHTMRD18"},
@@ -47,14 +50,120 @@ DEFAULT_SKU_SPECS = [
 ]
 
 # ==========================================
-# 2. SQLite 数据库底层逻辑
+# 2. GitHub 云端自动同步持久化模块（防休眠丢数据）
+# ==========================================
+def get_github_config():
+    """读取 Streamlit Secrets 中的 GitHub 配置"""
+    try:
+        token = st.secrets.get("GITHUB_TOKEN", "")
+        repo = st.secrets.get("GITHUB_REPO", "")
+        branch = st.secrets.get("GITHUB_BRANCH", "main")
+        if token and repo:
+            return {"token": str(token).strip(), "repo": str(repo).strip(), "branch": str(branch).strip()}
+    except Exception:
+        pass
+    return None
+
+def pull_db_from_github():
+    """容器唤醒启动时，自动从 GitHub 拉取最新的 waist_seal_wms.db 文件"""
+    cfg = get_github_config()
+    if not cfg:
+        return False
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{DB_FILE}?ref={cfg['branch']}"
+    req = urllib.request.Request(url, headers={
+        "Authorization": f"token {cfg['token']}",
+        "Accept": "application/vnd.github.v3+json",
+        "User-Agent": "Streamlit-WMS-App"
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if "content" in data:
+                db_bytes = base64.b64decode(data["content"])
+                with open(DB_FILE, "wb") as f:
+                    f.write(db_bytes)
+                return True
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return False
+    except Exception:
+        pass
+    return False
+
+def push_db_to_github(commit_msg="Update database from Streamlit"):
+    """每次数据变动后，自动将最新的 waist_seal_wms.db 推送保存到 GitHub"""
+    cfg = get_github_config()
+    if not cfg or not os.path.exists(DB_FILE):
+        return False, "未配置 GitHub 自动同步"
+    
+    url = f"https://api.github.com/repos/{cfg['repo']}/contents/{DB_FILE}"
+    headers = {
+        "Authorization": f"token {cfg['token']}",
+        "Accept": "application/vnd.github.v3+json",
+        "Content-Type": "application/json",
+        "User-Agent": "Streamlit-WMS-App"
+    }
+    
+    sha = None
+    try:
+        get_req = urllib.request.Request(f"{url}?ref={cfg['branch']}", headers=headers)
+        with urllib.request.urlopen(get_req, timeout=10) as resp:
+            res_data = json.loads(resp.read().decode("utf-8"))
+            sha = res_data.get("sha")
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            return False, f"查询远端失败: {e}"
+    except Exception as e:
+        return False, f"网络异常: {e}"
+        
+    try:
+        with open(DB_FILE, "rb") as f:
+            content_b64 = base64.b64encode(f.read()).decode("utf-8")
+            
+        payload = {
+            "message": f"[skip ci] {commit_msg} ({datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')})",
+            "content": content_b64,
+            "branch": cfg["branch"]
+        }
+        if sha:
+            payload["sha"] = sha
+            
+        put_req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="PUT"
+        )
+        with urllib.request.urlopen(put_req, timeout=15) as resp:
+            return True, "已同步至 GitHub 云端"
+    except Exception as e:
+        return False, f"云端同步失败: {e}"
+
+
+# ==========================================
+# 3. SQLite 数据库底层逻辑与自动升级
 # ==========================================
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE)
     conn.row_factory = sqlite3.Row
     return conn
 
+def save_and_sync(conn, action_desc="更新数据"):
+    """统一提交事务并触发 GitHub 云端同步"""
+    conn.commit()
+    conn.close()
+    ok, msg = push_db_to_github(action_desc)
+    if get_github_config() and not ok:
+        st.toast(f"⚠️ 本地已保存，但{msg}", icon="⚠️")
+    elif ok:
+        st.toast("✅ 数据已永久同步至 GitHub 云端", icon="☁️")
+
 def init_db():
+    # 容器首次启动时先尝试从 GitHub 拉取最新数据库
+    if "db_pulled" not in st.session_state:
+        pull_db_from_github()
+        st.session_state["db_pulled"] = True
+        
     conn = get_db_connection()
     cur = conn.cursor()
     
@@ -75,11 +184,21 @@ def init_db():
         factory TEXT NOT NULL,
         waist_spec TEXT NOT NULL,
         stock INTEGER DEFAULT 0,
+        pre_ship_qty INTEGER DEFAULT 0,
         safety_stock INTEGER DEFAULT 100,
         updated_at TEXT,
         PRIMARY KEY (factory, waist_spec)
     )
     ''')
+    
+    cur.execute('PRAGMA table_info(inventory)')
+    existing_cols = [r[1] for r in cur.fetchall()]
+    if 'pre_ship_qty' not in existing_cols:
+        try:
+            cur.execute('ALTER TABLE inventory ADD COLUMN pre_ship_qty INTEGER DEFAULT 0')
+            conn.commit()
+        except Exception:
+            pass
     
     cur.execute('''
     CREATE TABLE IF NOT EXISTS transactions (
@@ -109,12 +228,15 @@ def init_db():
             
             if item["腰封规格"]:
                 cur.execute('''
-                INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, safety_stock, updated_at)
-                VALUES (?, ?, 0, 100, ?)
+                INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at)
+                VALUES (?, ?, 0, 0, 100, ?)
                 ''', (item["工厂"], item["腰封规格"], now_str))
-                
-    conn.commit()
-    conn.close()
+        conn.commit()
+        conn.close()
+        push_db_to_github("Initialize seed database")
+    else:
+        conn.commit()
+        conn.close()
 
 init_db()
 
@@ -124,7 +246,9 @@ def get_inventory_df():
     SELECT 
         i.factory AS 工厂, 
         i.waist_spec AS 腰封规格, 
-        i.stock AS 当前库存, 
+        i.stock AS 在库库存, 
+        COALESCE(i.pre_ship_qty, 0) AS 预发货数量,
+        (i.stock - COALESCE(i.pre_ship_qty, 0)) AS 可用库存,
         i.safety_stock AS 安全库存预警值,
         COALESCE(GROUP_CONCAT(s.sku, ', '), '无关联SKU') AS 适配产品SKU,
         i.updated_at AS 最近更新时间
@@ -138,15 +262,19 @@ def get_inventory_df():
     
     if not df.empty:
         def calc_status(row):
-            if row['当前库存'] <= 0:
-                return "🔴 严重缺货"
-            elif row['当前库存'] <= row['安全库存预警值']:
-                return "🟡 安全预警"
+            avail = row['可用库存']
+            safety = row['安全库存预警值']
+            if avail < 0:
+                return f"🔴 预发超额缺货 (缺{-avail}件)"
+            elif avail <= 0:
+                return "🔴 无可用库存"
+            elif avail <= safety:
+                return "🟡 安全预警 (可用紧缺)"
             else:
                 return "🟢 充足"
                 
         df['库存状态'] = df.apply(calc_status, axis=1)
-        df['建议采购补货量'] = df.apply(lambda r: max(0, r['安全库存预警值'] - r['当前库存']), axis=1)
+        df['建议采购补货量'] = df.apply(lambda r: max(0, r['安全库存预警值'] - r['可用库存']), axis=1)
         
     return df
 
@@ -190,10 +318,10 @@ def to_excel_bytes(df):
 
 
 # ==========================================
-# 3. 页面布局与导航
+# 4. 页面布局与导航
 # ==========================================
 st.title("📦 腰封出入库与发货核算管理系统")
-st.caption("适用工厂独立核算 · 智能发货计划对照 · 缺货智能侦测 · 安全库存预警")
+st.caption("适用工厂独立核算 · 智能发货计划核算 · 预发货占用管理 · 缺货智能侦测 · 云端防丢持久化")
 
 with st.sidebar:
     st.header("📌 功能导航")
@@ -201,45 +329,69 @@ with st.sidebar:
         "请选择操作模块：",
         [
             "📊 库存总览与预警看板",
-            "🚚 发货出库（导入计划核算）",
+            "🚚 发货与预发货计划核算",
             "📥 采购入库（一步式直接入库）",
             "📋 出入库明细流水账",
             "⚙️ 规格对照表管理 (纠错/更换/新增)"
         ]
     )
+    
     st.markdown("---")
-    st.subheader("💡 业务规则备忘")
-    st.info(
-        "1. **工厂独立库存**：和光与颖泰的腰封分开独立记账。\n"
-        "2. **新规格逻辑**：未填写腰封规格的SKU视为未定做，当前算**0库存**，发货全部计为**缺货**。\n"
-        "3. **属性与规格纠错**：在【规格对照表管理】中随时可纠错修改形状（圆形/矩形等）、尺寸规格或重新指定腰封。"
-    )
+    st.subheader("☁️ 云端数据防丢状态")
+    gh_cfg = get_github_config()
+    if gh_cfg:
+        st.success(f"✅ **GitHub 云同步已开启**\n\n绑定仓库: `{gh_cfg['repo']}`\n*(休眠唤醒后数据永久保留)*")
+        if st.button("🔄 立即从云端强制刷新数据"):
+            if pull_db_from_github():
+                st.success("已拉取云端最新数据！")
+                st.rerun()
+    else:
+        st.warning("⚠️ **当前为临时容器存储**\n\n未配置 GitHub Token，Streamlit 休眠重启后数据会重置。请配置 Secrets 或使用下方手动备份。")
+        
+    with st.expander("💾 数据库一键备份与恢复 (.db)"):
+        if os.path.exists(DB_FILE):
+            with open(DB_FILE, "rb") as f:
+                st.download_button(
+                    label="📥 下载完整数据库文件 (.db)",
+                    data=f.read(),
+                    file_name=f"waist_seal_wms_{datetime.date.today()}.db",
+                    mime="application/octet-stream",
+                    use_container_width=True
+                )
+        restore_file = st.file_uploader("📂 上传恢复 .db 备份文件：", type=["db", "sqlite", "sqlite3"])
+        if restore_file is not None:
+            if st.button("⚠️ 确认恢复该备份数据库", use_container_width=True):
+                with open(DB_FILE, "wb") as f:
+                    f.write(restore_file.getvalue())
+                push_db_to_github("Restore database from backup")
+                st.success("✅ 数据库恢复成功！")
+                st.rerun()
 
 # ==========================================
-# 4. 模块一：库存总览与预警看板
+# 5. 模块一：库存总览与预警看板
 # ==========================================
 if menu == "📊 库存总览与预警看板":
     st.subheader("📊 腰封当前库存总览与预警看板")
     inv_df = get_inventory_df()
     
     col1, col2, col3, col4 = st.columns(4)
-    total_stock = inv_df['当前库存'].sum() if not inv_df.empty else 0
-    shortage_count = len(inv_df[inv_df['当前库存'] <= 0]) if not inv_df.empty else 0
-    warning_count = len(inv_df[(inv_df['当前库存'] > 0) & (inv_df['当前库存'] <= inv_df['安全库存预警值'])]) if not inv_df.empty else 0
-    normal_count = len(inv_df[inv_df['当前库存'] > inv_df['安全库存预警值']]) if not inv_df.empty else 0
+    total_physical = inv_df['在库库存'].sum() if not inv_df.empty else 0
+    total_pre_ship = inv_df['预发货数量'].sum() if not inv_df.empty else 0
+    total_available = inv_df['可用库存'].sum() if not inv_df.empty else 0
+    warning_items = len(inv_df[inv_df['可用库存'] <= inv_df['安全库存预警值']]) if not inv_df.empty else 0
     
-    col1.metric("腰封总在库件数", f"{total_stock:,} 件")
-    col2.metric("🟢 库存充足品项", f"{normal_count} 种")
-    col3.metric("🟡 安全预警品项", f"{warning_count} 种", delta=f"{warning_count} 需补货" if warning_count>0 else None, delta_color="inverse")
-    col4.metric("🔴 严重缺货品项", f"{shortage_count} 种", delta=f"{shortage_count} 缺货" if shortage_count>0 else None, delta_color="inverse")
+    col1.metric("腰封实物在库总量", f"{total_physical:,} 件")
+    col2.metric("📌 预发货待发占用", f"{total_pre_ship:,} 件", delta=f"{total_pre_ship} 占用" if total_pre_ship>0 else None, delta_color="off")
+    col3.metric("🟢 净可用库存", f"{total_available:,} 件", delta="净可用" if total_available>=0 else "超额预发", delta_color="normal" if total_available>=0 else "inverse")
+    col4.metric("⚠️ 需预警/补货品项", f"{warning_items} 种", delta=f"{warning_items} 项紧缺" if warning_items>0 else "库存健康", delta_color="inverse")
     
     st.markdown("---")
     
-    alert_df = inv_df[inv_df['当前库存'] <= inv_df['安全库存预警值']]
+    alert_df = inv_df[inv_df['可用库存'] <= inv_df['安全库存预警值']]
     if not alert_df.empty:
-        st.error(f"⚠️ 当前有 **{len(alert_df)}** 项腰封库存低于安全预警线或已断货，请及时安排订购！")
-        with st.expander("查看【需补货订购清单】", expanded=True):
-            display_alert = alert_df[['工厂', '腰封规格', '当前库存', '安全库存预警值', '建议采购补货量', '库存状态', '适配产品SKU']]
+        st.error(f"⚠️ 当前有 **{len(alert_df)}** 项腰封可用库存低于安全预警线或已出现预发超额缺货，请及时安排采购补货！")
+        with st.expander("查看【需补货订购清单 (已扣除预发占用)】", expanded=True):
+            display_alert = alert_df[['工厂', '腰封规格', '在库库存', '预发货数量', '可用库存', '安全库存预警值', '建议采购补货量', '库存状态', '适配产品SKU']]
             st.dataframe(display_alert, use_container_width=True)
             st.download_button(
                 label="📥 导出需补货清单 (Excel)",
@@ -264,67 +416,83 @@ if menu == "📊 库存总览与预警看板":
             filtered_df['适配产品SKU'].str.contains(search_spec, case=False, na=False)
         ]
         
-    st.dataframe(
-        filtered_df[['工厂', '腰封规格', '当前库存', '安全库存预警值', '库存状态', '建议采购补货量', '适配产品SKU', '最近更新时间']],
-        use_container_width=True
-    )
+    display_main_cols = ['工厂', '腰封规格', '在库库存', '预发货数量', '可用库存', '安全库存预警值', '库存状态', '建议采购补货量', '适配产品SKU', '最近更新时间']
+    st.dataframe(filtered_df[display_main_cols], use_container_width=True)
     
     st.download_button(
         label="📥 导出当前完整库存表 (Excel)",
-        data=to_excel_bytes(filtered_df),
+        data=to_excel_bytes(filtered_df[display_main_cols]),
         file_name=f"腰封库存总览_{datetime.date.today()}.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
     )
     
     st.markdown("---")
-    with st.expander("⚙️ 快捷调整安全预警值 / 盘点修正库存"):
-        pcol1, pcol2, pcol3, pcol4 = st.columns(4)
+    with st.expander("⚙️ 快捷调整：预发货数量 / 盘点在库库存 / 安全预警值"):
+        pcol1, pcol2 = st.columns(2)
         with pcol1:
-            sel_factory = st.selectbox("选择工厂", sorted(list(inv_df['工厂'].unique())), key="adj_fac")
+            sel_factory = st.selectbox("选择目标工厂", sorted(list(inv_df['工厂'].unique())), key="adj_fac")
         with pcol2:
             specs_for_fac = sorted(list(inv_df[inv_df['工厂'] == sel_factory]['腰封规格'].unique()))
-            sel_spec = st.selectbox("选择腰封规格", specs_for_fac, key="adj_spec")
+            sel_spec = st.selectbox("选择目标腰封规格", specs_for_fac, key="adj_spec")
         
         cur_row = inv_df[(inv_df['工厂'] == sel_factory) & (inv_df['腰封规格'] == sel_spec)].iloc[0]
         
+        pcol3, pcol4, pcol5 = st.columns(3)
         with pcol3:
-            new_safety = st.number_input("设置安全库存预警值", min_value=0, value=int(cur_row['安全库存预警值']), step=10)
+            new_stock = st.number_input("在库实物库存 (直接盘点覆盖)", min_value=0, value=int(cur_row['在库库存']), step=10)
         with pcol4:
-            new_stock = st.number_input("盘点修正当前库存（直接覆盖）", min_value=0, value=int(cur_row['当前库存']), step=10)
+            new_pre_ship = st.number_input("📌 预发货数量 (待发占用)", min_value=0, value=int(cur_row['预发货数量']), step=10)
+        with pcol5:
+            new_safety = st.number_input("安全库存预警值", min_value=0, value=int(cur_row['安全库存预警值']), step=10)
             
-        adj_remark = st.text_input("调整/盘点备注：", value="日常安全值维护或盘点核准")
+        adj_remark = st.text_input("调整备注：", value="日常预发微调或盘点更新")
         
-        if st.button("💾 保存调整", key="btn_save_adj"):
-            conn = get_db_connection()
-            cur = conn.cursor()
-            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            old_stock = int(cur_row['当前库存'])
-            
-            cur.execute('''
-            UPDATE inventory 
-            SET stock = ?, safety_stock = ?, updated_at = ?
-            WHERE factory = ? AND waist_spec = ?
-            ''', (new_stock, new_safety, now_str, sel_factory, sel_spec))
-            
-            if new_stock != old_stock:
-                diff = new_stock - old_stock
+        btn_c1, btn_c2 = st.columns([1, 1])
+        with btn_c1:
+            if st.button("💾 保存调整", key="btn_save_adj", type="primary"):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                old_stk = int(cur_row['在库库存'])
+                old_pre = int(cur_row['预发货数量'])
+                
+                cur.execute('''
+                UPDATE inventory 
+                SET stock = ?, pre_ship_qty = ?, safety_stock = ?, updated_at = ?
+                WHERE factory = ? AND waist_spec = ?
+                ''', (new_stock, new_pre_ship, new_safety, now_str, sel_factory, sel_spec))
+                
+                if new_stock != old_stk or new_pre_ship != old_pre:
+                    cur.execute('''
+                    INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (now_str, "库存/预发调整", sel_factory, sel_spec, new_stock - old_stk, old_stk, new_stock, "MANUAL-ADJ", f"预发: {old_pre}->{new_pre_ship}", "管理员", adj_remark))
+                    
+                save_and_sync(conn, f"Adjust inventory {sel_factory} {sel_spec}")
+                st.success(f"✅ 【{sel_factory}】规格【{sel_spec}】已成功更新！当前可用库存为 {new_stock - new_pre_ship} 件。")
+                st.rerun()
+                
+        with btn_c2:
+            if st.button("🧹 一键清空该规格预发货数量 (归零)", key="btn_clear_pre"):
+                conn = get_db_connection()
+                cur = conn.cursor()
+                now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                cur.execute('UPDATE inventory SET pre_ship_qty = 0, updated_at = ? WHERE factory = ? AND waist_spec = ?', (now_str, sel_factory, sel_spec))
                 cur.execute('''
                 INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ''', (now_str, "盘点调整", sel_factory, sel_spec, diff, old_stock, new_stock, "MANUAL-ADJ", "", "管理员", adj_remark))
-                
-            conn.commit()
-            conn.close()
-            st.success(f"✅ 【{sel_factory}】规格【{sel_spec}】已成功更新！")
-            st.rerun()
+                ''', (now_str, "清空预发货", sel_factory, sel_spec, 0, int(cur_row['在库库存']), int(cur_row['在库库存']), "CLEAR-PRE", "预发清零", "管理员", "发货完毕或计划取消"))
+                save_and_sync(conn, f"Clear pre-ship {sel_factory} {sel_spec}")
+                st.success("✅ 预发货数量已成功清零！")
+                st.rerun()
 
 
 # ==========================================
-# 5. 模块二：发货出库（导入计划核算）
+# 6. 模块二：发货与预发货计划核算
 # ==========================================
-elif menu == "🚚 发货出库（导入计划核算）":
-    st.subheader("🚚 发货出库核算（上传发货计划，自动核对腰封）")
-    st.write("上传发货计划表格（如 `shipment_plan_xxx.xlsx`），系统将自动匹配SKU对应的工厂与腰封规格，精准核算消耗量与缺货情况。")
+elif menu == "🚚 发货与预发货计划核算":
+    st.subheader("🚚 发货与预发货计划核算（支持锁定预发 & 正式出库）")
+    st.write("上传发货计划表格，系统将自动核算腰封需求。您可以选择**【📌 登记为预发货 (提前锁定占用)】**，或**【🚀 确认正式发货出库 (扣减实物)】**。")
     
     uploaded_file = st.file_uploader("📂 请选择或拖入发货计划 Excel 文件：", type=["xlsx", "xls"])
     
@@ -371,50 +539,59 @@ elif menu == "🚚 发货出库（导入计划核算）":
                         analysis_records.append({
                             "工厂": fac_name,
                             "腰封规格": "【未订做规格/新规格】",
-                            "涉及SKU及发货量": skus_detail,
                             "本次需求量": total_demand,
-                            "当前库存": 0,
-                            "发货后预计结存": -total_demand,
+                            "当前在库实物": 0,
+                            "当前预发占用": 0,
+                            "当前可用库存": 0,
+                            "本次结存可用": -total_demand,
                             "缺货数量": total_demand,
                             "状态": "❌ 缺货 (未订做新规格)",
+                            "涉及SKU及发货量": skus_detail,
                             "is_unmade": True
                         })
                     else:
-                        cur_stock_match = inv_df[(inv_df["工厂"] == factory) & (inv_df["腰封规格"] == waist)]
-                        cur_stock = cur_stock_match["当前库存"].iloc[0] if not cur_stock_match.empty else 0
+                        cur_row_match = inv_df[(inv_df["工厂"] == factory) & (inv_df["腰封规格"] == waist)]
+                        cur_phys = cur_row_match["在库库存"].iloc[0] if not cur_row_match.empty else 0
+                        cur_pre = cur_row_match["预发货数量"].iloc[0] if not cur_row_match.empty else 0
+                        cur_avail = cur_row_match["可用库存"].iloc[0] if not cur_row_match.empty else 0
                         
-                        shortage = max(0, total_demand - cur_stock)
-                        proj_stock = cur_stock - total_demand
-                        status = "✅ 库存充足" if shortage == 0 else f"❌ 缺货 ({shortage}件)"
+                        after_avail = cur_avail - total_demand
+                        shortage = max(0, total_demand - cur_avail)
                         
+                        if shortage == 0:
+                            status = "🟢 可用库存充足"
+                        elif cur_phys >= total_demand:
+                            status = f"🟡 实物充足但预发占用紧缺 (差{shortage}件)"
+                        else:
+                            status = f"🔴 实物缺货 (缺{shortage}件)"
+                            
                         analysis_records.append({
                             "工厂": factory,
                             "腰封规格": waist,
-                            "涉及SKU及发货量": skus_detail,
                             "本次需求量": total_demand,
-                            "当前库存": cur_stock,
-                            "发货后预计结存": proj_stock,
+                            "当前在库实物": cur_phys,
+                            "当前预发占用": cur_pre,
+                            "当前可用库存": cur_avail,
+                            "本次结存可用": after_avail,
                             "缺货数量": shortage,
                             "状态": status,
+                            "涉及SKU及发货量": skus_detail,
                             "is_unmade": False
                         })
                         
                 analysis_df = pd.DataFrame(analysis_records)
                 analysis_df.sort_values(by=["缺货数量"], ascending=False, inplace=True)
                 
-                st.markdown("### 📊 腰封消耗与缺货核算结果")
+                st.markdown("### 📊 腰封需求核算明细")
                 total_need = analysis_df["本次需求量"].sum()
                 total_short = analysis_df["缺货数量"].sum()
                 
                 kcol1, kcol2, kcol3 = st.columns(3)
-                kcol1.metric("本次发货腰封总需求", f"{total_need} 件")
-                kcol2.metric("当前满足可出库", f"{total_need - total_short} 件")
-                kcol3.metric("总缺货量", f"{total_short} 件", delta=f"{total_short} 缺口" if total_short > 0 else "无缺货", delta_color="inverse")
+                kcol1.metric("本次计划总需求", f"{total_need} 件")
+                kcol2.metric("当前满足可发量", f"{total_need - total_short} 件")
+                kcol3.metric("需关注缺口量", f"{total_short} 件", delta=f"{total_short} 缺口" if total_short > 0 else "无缺口", delta_color="inverse")
                 
-                if total_short > 0:
-                    st.warning(f"⚠️ 发货计划中共有 **{total_short}** 件腰封缺货（包含未订做新规格与现有库存不足的规格），请参考下表核对！")
-                    
-                display_cols = ["工厂", "腰封规格", "本次需求量", "当前库存", "发货后预计结存", "缺货数量", "状态", "涉及SKU及发货量"]
+                display_cols = ["工厂", "腰封规格", "本次需求量", "当前在库实物", "当前预发占用", "当前可用库存", "本次结存可用", "缺货数量", "状态", "涉及SKU及发货量"]
                 st.dataframe(analysis_df[display_cols], use_container_width=True)
                 
                 st.download_button(
@@ -425,65 +602,98 @@ elif menu == "🚚 发货出库（导入计划核算）":
                 )
                 
                 st.markdown("---")
-                st.markdown("### 🚀 执行出库扣减")
+                st.markdown("### 🛠️ 选择执行操作")
                 
                 default_batch = str(clean_plan['发货批次号'].iloc[0]) if not clean_plan.empty else datetime.date.today().strftime("OUT-%Y%m%d")
-                out_batch_no = st.text_input("出库登记批次号：", value=default_batch)
-                out_operator = st.text_input("发货操作人：", value="发货仓管")
-                out_remark = st.text_input("发货备注：", value="按发货计划批量扣减出库")
+                out_batch_no = st.text_input("关联发货批次号：", value=default_batch)
+                out_operator = st.text_input("操作人：", value="发货仓管")
+                out_remark = st.text_input("备注说明：", value="发货计划批次调度")
                 
-                col_btn, col_note = st.columns([1, 3])
-                with col_btn:
-                    confirm_out = st.button("✅ 确认执行出库扣减", type="primary")
-                    
-                with col_note:
-                    st.caption("注：点击后将自动扣减对应工厂腰封规格的库存，并记录出库流水日志。未订做的规格将记录为【缺货发货流水】，不会产生负库存。")
-                    
-                if confirm_out:
-                    conn = get_db_connection()
-                    cur = conn.cursor()
-                    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    
-                    for _, row in analysis_df.iterrows():
-                        fac = row["工厂"]
-                        spec = row["腰封规格"]
-                        need_qty = int(row["本次需求量"])
-                        cur_stk = int(row["当前库存"])
-                        skus_info = row["涉及SKU及发货量"]
+                action_col1, action_col2 = st.columns(2)
+                
+                with action_col1:
+                    st.info("📌 **方案 A：登记为预发货（提前锁定腰封）**\n\n"
+                            "货品正在备货/贴标/拣货阶段，**先不扣减实物库存**，而是将需求计入**【预发货数量】**锁定占用，减少“可用库存”，防止与其他批次撞车。")
+                    if st.button("📌 确认登记为预发货 (锁定腰封)", type="secondary"):
+                        conn = get_db_connection()
+                        cur = conn.cursor()
+                        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         
-                        if row["is_unmade"]:
-                            cur.execute('''
-                            INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (now_str, "发货出库(未订做缺货)", fac, spec, -need_qty, 0, 0, out_batch_no, skus_info, out_operator, f"{out_remark} [新规格缺货直接放行]"))
-                        else:
-                            after_stk = cur_stk - need_qty
-                            cur.execute('''
-                            UPDATE inventory 
-                            SET stock = ?, updated_at = ?
-                            WHERE factory = ? AND waist_spec = ?
-                            ''', (after_stk, now_str, fac, spec))
+                        for _, row in analysis_df.iterrows():
+                            fac = row["工厂"]
+                            spec = row["腰封规格"]
+                            need_qty = int(row["本次需求量"])
+                            skus_info = row["涉及SKU及发货量"]
                             
-                            cur.execute('''
-                            INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (now_str, "发货出库", fac, spec, -need_qty, cur_stk, after_stk, out_batch_no, skus_info, out_operator, out_remark))
+                            if not row["is_unmade"]:
+                                cur.execute('''
+                                UPDATE inventory 
+                                SET pre_ship_qty = pre_ship_qty + ?, updated_at = ?
+                                WHERE factory = ? AND waist_spec = ?
+                                ''', (need_qty, now_str, fac, spec))
+                                
+                                cur.execute('''
+                                INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (now_str, "预发货锁定", fac, spec, need_qty, int(row["当前在库实物"]), int(row["当前在库实物"]), out_batch_no, skus_info, out_operator, f"{out_remark} [锁定预发占用]"))
+                                
+                        save_and_sync(conn, f"Lock pre-ship batch {out_batch_no}")
+                        st.success(f"🎉 批次【{out_batch_no}】已成功登记为预发货！相关腰封已提前锁定占用。")
+                        st.balloons()
+                        st.rerun()
+                        
+                with action_col2:
+                    st.success("🚀 **方案 B：确认正式发货出库（扣减在库实物）**\n\n"
+                               "货物已经打包完毕装车发出，**正式扣减在库实物库存**。")
+                    auto_release_pre = st.checkbox("如果该批次之前已登记过预发货，发货时同步释放/扣减预发占用", value=True)
+                    if st.button("🚀 确认正式发货出库", type="primary"):
+                        conn = get_db_connection()
+                        cur = conn.cursor()
+                        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        
+                        for _, row in analysis_df.iterrows():
+                            fac = row["工厂"]
+                            spec = row["腰封规格"]
+                            need_qty = int(row["本次需求量"])
+                            cur_phys = int(row["当前在库实物"])
+                            cur_pre = int(row["当前预发占用"])
+                            skus_info = row["涉及SKU及发货量"]
                             
-                    conn.commit()
-                    conn.close()
-                    st.success(f"🎉 发货出库已成功执行！批次号【{out_batch_no}】的相关腰封库存已同步扣减完成。")
-                    st.balloons()
-                    
+                            if row["is_unmade"]:
+                                cur.execute('''
+                                INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (now_str, "发货出库(未订做缺货)", fac, spec, -need_qty, 0, 0, out_batch_no, skus_info, out_operator, f"{out_remark} [新规格缺货直接放行]"))
+                            else:
+                                after_phys = cur_phys - need_qty
+                                after_pre = max(0, cur_pre - need_qty) if auto_release_pre else cur_pre
+                                
+                                cur.execute('''
+                                UPDATE inventory 
+                                SET stock = ?, pre_ship_qty = ?, updated_at = ?
+                                WHERE factory = ? AND waist_spec = ?
+                                ''', (after_phys, after_pre, now_str, fac, spec))
+                                
+                                cur.execute('''
+                                INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                ''', (now_str, "正式发货出库", fac, spec, -need_qty, cur_phys, after_phys, out_batch_no, skus_info, out_operator, f"{out_remark} (释放预发:{cur_pre}->{after_pre})"))
+                                
+                        save_and_sync(conn, f"Outbound batch {out_batch_no}")
+                        st.success(f"🎉 批次【{out_batch_no}】正式发货出库完成！实物库存已完成扣减。")
+                        st.balloons()
+                        st.rerun()
+                        
         except Exception as e:
             st.error(f"处理文件时发生错误：{e}")
 
 
 # ==========================================
-# 6. 模块三：采购入库（一步式直接入库）
+# 7. 模块三：采购入库（一步式直接入库）
 # ==========================================
 elif menu == "📥 采购入库（一步式直接入库）":
     st.subheader("📥 采购入库（一步式直接入库，各工厂独立）")
-    st.write("向包材厂订购的腰封到货后，在此处直接一步录入，库存即时增加，并自动记入流水账。")
+    st.write("向包材厂订购的腰封到货后，在此处直接一步录入，在库库存即时增加，并自动记入流水账。")
     
     inv_df = get_inventory_df()
     known_factories = sorted(list(inv_df['工厂'].unique())) if not inv_df.empty else ["和光", "颖泰"]
@@ -545,8 +755,8 @@ elif menu == "📥 采购入库（一步式直接入库）":
                         cur_stock = 0
                         new_stock = in_qty
                         cur.execute('''
-                        INSERT INTO inventory (factory, waist_spec, stock, safety_stock, updated_at)
-                        VALUES (?, ?, ?, 100, ?)
+                        INSERT INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at)
+                        VALUES (?, ?, ?, 0, 100, ?)
                         ''', (in_factory, in_spec, new_stock, now_str))
                         
                     cur.execute('''
@@ -554,10 +764,10 @@ elif menu == "📥 采购入库（一步式直接入库）":
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ''', (now_str, "采购入库", in_factory, in_spec, in_qty, cur_stock, new_stock, in_batch, "", in_operator, in_remark))
                     
-                    conn.commit()
-                    conn.close()
-                    st.success(f"🎉 入库成功！【{in_factory}】规格【{in_spec}】入库 +{in_qty} 件。原库存：{cur_stock} 件 ➔ 现库存：{new_stock} 件！")
+                    save_and_sync(conn, f"Inbound {in_factory} {in_spec} +{in_qty}")
+                    st.success(f"🎉 入库成功！【{in_factory}】规格【{in_spec}】实物在库 +{in_qty} 件。原库存：{cur_stock} 件 ➔ 现库存：{new_stock} 件！")
                     st.balloons()
+                    st.rerun()
                     
     with tab_batch:
         st.write("上传批量入库 Excel 表格进行一键批量入库（包含列：`工厂`、`腰封规格`、`入库数量`、`批次号`（可选）、`备注`（可选））。")
@@ -587,7 +797,7 @@ elif menu == "📥 采购入库（一步式直接入库）":
                         if erow:
                             cur.execute('UPDATE inventory SET stock = ?, updated_at = ? WHERE factory = ? AND waist_spec = ?', (n_stk, now_str, bfac, bspec))
                         else:
-                            cur.execute('INSERT INTO inventory (factory, waist_spec, stock, safety_stock, updated_at) VALUES (?, ?, ?, 100, ?)', (bfac, bspec, n_stk, now_str))
+                            cur.execute('INSERT INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at) VALUES (?, ?, ?, 0, 100, ?)', (bfac, bspec, n_stk, now_str))
                             
                         cur.execute('''
                         INSERT INTO transactions (timestamp, trans_type, factory, waist_spec, quantity, before_stock, after_stock, batch_no, sku_details, operator, remark)
@@ -595,19 +805,19 @@ elif menu == "📥 采购入库（一步式直接入库）":
                         ''', (now_str, "采购入库", bfac, bspec, bqty, c_stk, n_stk, bbatch, "", "批量操作员", bremark))
                         count += 1
                         
-                    conn.commit()
-                    conn.close()
+                    save_and_sync(conn, f"Batch inbound {count} items")
                     st.success(f"✅ 成功完成 {count} 笔规格的批量入库！")
+                    st.rerun()
             except Exception as e:
                 st.error(f"批量入库失败：{e}")
 
 
 # ==========================================
-# 7. 模块四：出入库明细流水账
+# 8. 模块四：出入库明细流水账
 # ==========================================
 elif menu == "📋 出入库明细流水账":
     st.subheader("📋 腰封出入库明细流水账")
-    st.write("记录所有采购入库、发货出库以及盘点调整的完整历史台账，数据永久沉淀支持溯源与审计。")
+    st.write("记录所有采购入库、预发货锁定、正式发货出库以及盘点调整的完整历史台账，支持溯源与审计。")
     
     tx_df = get_transactions_df()
     
@@ -649,7 +859,7 @@ elif menu == "📋 出入库明细流水账":
 
 
 # ==========================================
-# 8. 模块五：规格对照表管理 (纠错/更换/新增)
+# 9. 模块五：规格对照表管理 (纠错/更换/新增)
 # ==========================================
 elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
     st.subheader("⚙️ 腰封规格与 SKU 对照表管理")
@@ -665,9 +875,6 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
         "📤 上传 Excel 批量更新/追加"
     ])
     
-    # ---------------------------------------------
-    # 选项卡 1：修改 / 纠错现有 SKU（改形状、规格、腰封、工厂等）
-    # ---------------------------------------------
     with tab_modify:
         st.markdown("#### ✏️ 修改 / 纠错 SKU 属性或腰封规格")
         st.caption("例如：录入时误将【圆形】录成了【矩形】、尺寸写错、或者更换了新腰封规格，均可在此直接修改保存。")
@@ -691,7 +898,6 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
             with col_e2:
                 edit_material = st.text_input("产品材质：", value=str(sku_info['材质']) if pd.notna(sku_info['材质']) else "")
             with col_e3:
-                # 形状纠错核心选项
                 standard_shapes = ["圆形", "矩形", "方形", "椭圆形", "其他"]
                 cur_shape = str(sku_info['形状']).strip() if pd.notna(sku_info['形状']) else "矩形"
                 shape_idx = standard_shapes.index(cur_shape) if cur_shape in standard_shapes else len(standard_shapes) - 1
@@ -729,13 +935,11 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
                     
                     if clean_waist:
                         cur.execute('''
-                        INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, safety_stock, updated_at)
-                        VALUES (?, ?, 0, 100, ?)
+                        INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at)
+                        VALUES (?, ?, 0, 0, 100, ?)
                         ''', (clean_fac, clean_waist, now_str))
                         
-                    conn.commit()
-                    conn.close()
-                    
+                    save_and_sync(conn, f"Edit SKU {target_sku}")
                     st.success(f"🎉 SKU【{target_sku}】修改已成功保存！\n\n"
                                f"最新属性：工厂【{clean_fac}】· 材质【{clean_mat}】· **形状【{clean_shape}】** · 规格【{clean_dim}】· 腰封【{clean_waist or '暂未订做'}】")
                     st.balloons()
@@ -749,16 +953,12 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
                     conn = get_db_connection()
                     cur = conn.cursor()
                     cur.execute('DELETE FROM sku_mapping WHERE sku = ?', (target_sku,))
-                    conn.commit()
-                    conn.close()
+                    save_and_sync(conn, f"Delete SKU {target_sku}")
                     st.success(f"SKU【{target_sku}】已被成功删除。")
                     st.rerun()
                 else:
                     st.error("请先勾选确认复选框！")
 
-    # ---------------------------------------------
-    # 选项卡 2：手动新增全新 SKU
-    # ---------------------------------------------
     with tab_add_new:
         st.markdown("#### ➕ 录入单个新产品 SKU")
         st.caption("新产品上线时，在此填写产品属性与对应的腰封规格。如果腰封还未定做，腰封规格留空即可。")
@@ -818,19 +1018,15 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
                         
                         if clean_waist:
                             cur.execute('''
-                            INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, safety_stock, updated_at)
-                            VALUES (?, ?, 0, 100, ?)
+                            INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at)
+                            VALUES (?, ?, 0, 0, 100, ?)
                             ''', (n_factory.strip(), clean_waist, now_str))
                             
-                        conn.commit()
-                        conn.close()
+                        save_and_sync(conn, f"Add SKU {clean_sku}")
                         st.success(f"🎉 新 SKU【{clean_sku}】录入成功！归属工厂：{n_factory}，腰封规格：{clean_waist or '暂未订做(0库存)'}。")
                         st.balloons()
                         st.rerun()
 
-    # ---------------------------------------------
-    # 选项卡 3：批量导入 / 覆盖更新
-    # ---------------------------------------------
     with tab_batch_upload:
         st.markdown("#### 📤 通过 Excel 表格批量导入 / 批量更新 SKU")
         st.caption("表格列名需包含：`工厂`、`材质`、`形状`、`规格`、`腰封规格`、`SKU`。")
@@ -867,13 +1063,12 @@ elif menu == "⚙️ 规格对照表管理 (纠错/更换/新增)":
                     
                     if w_val:
                         cur.execute('''
-                        INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, safety_stock, updated_at)
-                        VALUES (?, ?, 0, 100, ?)
+                        INSERT OR IGNORE INTO inventory (factory, waist_spec, stock, pre_ship_qty, safety_stock, updated_at)
+                        VALUES (?, ?, 0, 0, 100, ?)
                         ''', (fac_val, w_val, now_str))
                     added_cnt += 1
                     
-                conn.commit()
-                conn.close()
+                save_and_sync(conn, f"Batch update {added_cnt} SKUs")
                 st.success(f"✅ Excel 批量导入处理完成！共导入/更新了 {added_cnt} 个 SKU 的规格对应关系。")
                 st.rerun()
             except Exception as e:
